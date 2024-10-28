@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/apernet/OpenGFW/analyzer"
 	"github.com/apernet/OpenGFW/analyzer/tcp"
@@ -16,6 +17,7 @@ import (
 	"github.com/apernet/OpenGFW/modifier"
 	modUDP "github.com/apernet/OpenGFW/modifier/udp"
 	"github.com/apernet/OpenGFW/ruleset"
+	"github.com/apernet/OpenGFW/ruleset/builtins/geo"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -41,6 +43,7 @@ var logger *zap.Logger
 // Flags
 var (
 	cfgFile   string
+	pcapFile  string
 	logLevel  string
 	logFormat string
 )
@@ -87,9 +90,14 @@ var logFormatMap = map[string]zapcore.EncoderConfig{
 var analyzers = []analyzer.Analyzer{
 	&tcp.FETAnalyzer{},
 	&tcp.HTTPAnalyzer{},
+	&tcp.SocksAnalyzer{},
 	&tcp.SSHAnalyzer{},
 	&tcp.TLSAnalyzer{},
+	&tcp.TrojanAnalyzer{},
 	&udp.DNSAnalyzer{},
+	&udp.OpenVPNAnalyzer{},
+	&udp.QUICAnalyzer{},
+	&udp.WireGuardAnalyzer{},
 }
 
 var modifiers = []modifier.Modifier{
@@ -111,6 +119,7 @@ func init() {
 
 func initFlags() {
 	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "config file")
+	rootCmd.PersistentFlags().StringVarP(&pcapFile, "pcap", "p", "", "pcap file (optional)")
 	rootCmd.PersistentFlags().StringVarP(&logLevel, "log-level", "l", envOrDefaultString(appLogLevelEnv, "info"), "log level")
 	rootCmd.PersistentFlags().StringVarP(&logFormat, "log-format", "f", envOrDefaultString(appLogFormatEnv, "console"), "log format")
 }
@@ -159,19 +168,39 @@ func initLogger() {
 type cliConfig struct {
 	IO      cliConfigIO      `mapstructure:"io"`
 	Workers cliConfigWorkers `mapstructure:"workers"`
+	Ruleset cliConfigRuleset `mapstructure:"ruleset"`
+	Replay  cliConfigReplay  `mapstructure:"replay"`
 }
 
 type cliConfigIO struct {
-	QueueSize uint32 `mapstructure:"queueSize"`
-	Local     bool   `mapstructure:"local"`
+	QueueSize      uint32  `mapstructure:"queueSize"`
+	QueueNum       *uint16 `mapstructure:"queueNum"`
+	Table          string  `mapstructure:"table"`
+	ConnMarkAccept uint32  `mapstructure:"connMarkAccept"`
+	ConnMarkDrop   uint32  `mapstructure:"connMarkDrop"`
+
+	ReadBuffer  int  `mapstructure:"rcvBuf"`
+	WriteBuffer int  `mapstructure:"sndBuf"`
+	Local       bool `mapstructure:"local"`
+	RST         bool `mapstructure:"rst"`
+}
+
+type cliConfigReplay struct {
+	Realtime bool `mapstructure:"realtime"`
 }
 
 type cliConfigWorkers struct {
-	Count                      int `mapstructure:"count"`
-	QueueSize                  int `mapstructure:"queueSize"`
-	TCPMaxBufferedPagesTotal   int `mapstructure:"tcpMaxBufferedPagesTotal"`
-	TCPMaxBufferedPagesPerConn int `mapstructure:"tcpMaxBufferedPagesPerConn"`
-	UDPMaxStreams              int `mapstructure:"udpMaxStreams"`
+	Count                      int           `mapstructure:"count"`
+	QueueSize                  int           `mapstructure:"queueSize"`
+	TCPMaxBufferedPagesTotal   int           `mapstructure:"tcpMaxBufferedPagesTotal"`
+	TCPMaxBufferedPagesPerConn int           `mapstructure:"tcpMaxBufferedPagesPerConn"`
+	TCPTimeout                 time.Duration `mapstructure:"tcpTimeout"`
+	UDPMaxStreams              int           `mapstructure:"udpMaxStreams"`
+}
+
+type cliConfigRuleset struct {
+	GeoIp   string `mapstructure:"geoip"`
+	GeoSite string `mapstructure:"geosite"`
 }
 
 func (c *cliConfig) fillLogger(config *engine.Config) error {
@@ -180,14 +209,35 @@ func (c *cliConfig) fillLogger(config *engine.Config) error {
 }
 
 func (c *cliConfig) fillIO(config *engine.Config) error {
-	nfio, err := io.NewNFQueuePacketIO(io.NFQueuePacketIOConfig{
-		QueueSize: c.IO.QueueSize,
-		Local:     c.IO.Local,
-	})
+	var ioImpl io.PacketIO
+	var err error
+	if pcapFile != "" {
+		// Setup IO for pcap file replay
+		logger.Info("replaying from pcap file", zap.String("pcap file", pcapFile))
+		ioImpl, err = io.NewPcapPacketIO(io.PcapPacketIOConfig{
+			PcapFile: pcapFile,
+			Realtime: c.Replay.Realtime,
+		})
+	} else {
+		// Setup IO for nfqueue
+		ioImpl, err = io.NewNFQueuePacketIO(io.NFQueuePacketIOConfig{
+			QueueSize:      c.IO.QueueSize,
+			QueueNum:       c.IO.QueueNum,
+			Table:          c.IO.Table,
+			ConnMarkAccept: c.IO.ConnMarkAccept,
+			ConnMarkDrop:   c.IO.ConnMarkDrop,
+
+			ReadBuffer:  c.IO.ReadBuffer,
+			WriteBuffer: c.IO.WriteBuffer,
+			Local:       c.IO.Local,
+			RST:         c.IO.RST,
+		})
+	}
+
 	if err != nil {
 		return configError{Field: "io", Err: err}
 	}
-	config.IOs = []io.PacketIO{nfio}
+	config.IO = ioImpl
 	return nil
 }
 
@@ -196,6 +246,7 @@ func (c *cliConfig) fillWorkers(config *engine.Config) error {
 	config.WorkerQueueSize = c.Workers.QueueSize
 	config.WorkerTCPMaxBufferedPagesTotal = c.Workers.TCPMaxBufferedPagesTotal
 	config.WorkerTCPMaxBufferedPagesPerConn = c.Workers.TCPMaxBufferedPagesPerConn
+	config.WorkerTCPTimeout = c.Workers.TCPTimeout
 	config.WorkerUDPMaxStreams = c.Workers.UDPMaxStreams
 	return nil
 }
@@ -230,19 +281,19 @@ func runMain(cmd *cobra.Command, args []string) {
 	if err != nil {
 		logger.Fatal("failed to parse config", zap.Error(err))
 	}
-	defer func() {
-		// Make sure to close all IOs on exit
-		for _, i := range engineConfig.IOs {
-			_ = i.Close()
-		}
-	}()
+	defer engineConfig.IO.Close() // Make sure to close IO on exit
 
 	// Ruleset
 	rawRs, err := ruleset.ExprRulesFromYAML(args[0])
 	if err != nil {
 		logger.Fatal("failed to load rules", zap.Error(err))
 	}
-	rs, err := ruleset.CompileExprRules(rawRs, analyzers, modifiers)
+	rsConfig := &ruleset.BuiltinConfig{
+		Logger:               &rulesetLogger{},
+		GeoMatcher:           geo.NewGeoMatcher(config.Ruleset.GeoSite, config.Ruleset.GeoIp),
+		ProtectedDialContext: engineConfig.IO.ProtectedDialContext,
+	}
+	rs, err := ruleset.CompileExprRules(rawRs, analyzers, modifiers, rsConfig)
 	if err != nil {
 		logger.Fatal("failed to compile rules", zap.Error(err))
 	}
@@ -254,14 +305,42 @@ func runMain(cmd *cobra.Command, args []string) {
 		logger.Fatal("failed to initialize engine", zap.Error(err))
 	}
 
+	// Signal handling
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	go func() {
-		sigChan := make(chan os.Signal)
-		signal.Notify(sigChan, os.Interrupt, os.Kill)
-		<-sigChan
+		// Graceful shutdown
+		shutdownChan := make(chan os.Signal, 1)
+		signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
+		<-shutdownChan
 		logger.Info("shutting down gracefully...")
 		cancelFunc()
 	}()
+	go func() {
+		// Rule reload
+		reloadChan := make(chan os.Signal, 1)
+		signal.Notify(reloadChan, syscall.SIGHUP)
+		for {
+			<-reloadChan
+			logger.Info("reloading rules")
+			rawRs, err := ruleset.ExprRulesFromYAML(args[0])
+			if err != nil {
+				logger.Error("failed to load rules, using old rules", zap.Error(err))
+				continue
+			}
+			rs, err := ruleset.CompileExprRules(rawRs, analyzers, modifiers, rsConfig)
+			if err != nil {
+				logger.Error("failed to compile rules, using old rules", zap.Error(err))
+				continue
+			}
+			err = en.UpdateRuleset(rs)
+			if err != nil {
+				logger.Error("failed to update ruleset", zap.Error(err))
+			} else {
+				logger.Info("rules reloaded")
+			}
+		}
+	}()
+
 	logger.Info("engine started")
 	logger.Info("engine exited", zap.Error(en.Run(ctx)))
 }
@@ -294,12 +373,26 @@ func (l *engineLogger) TCPStreamPropUpdate(info ruleset.StreamInfo, close bool) 
 }
 
 func (l *engineLogger) TCPStreamAction(info ruleset.StreamInfo, action ruleset.Action, noMatch bool) {
-	logger.Info("TCP stream action",
-		zap.Int64("id", info.ID),
-		zap.String("src", info.SrcString()),
-		zap.String("dst", info.DstString()),
-		zap.String("action", action.String()),
-		zap.Bool("noMatch", noMatch))
+	if noMatch {
+		logger.Debug("TCP stream no match",
+			zap.Int64("id", info.ID),
+			zap.String("src", info.SrcString()),
+			zap.String("dst", info.DstString()),
+			zap.String("action", action.String()))
+	} else {
+		logger.Info("TCP stream action",
+			zap.Int64("id", info.ID),
+			zap.String("src", info.SrcString()),
+			zap.String("dst", info.DstString()),
+			zap.String("action", action.String()))
+	}
+}
+
+func (l *engineLogger) TCPFlush(workerID, flushed, closed int) {
+	logger.Debug("TCP flush",
+		zap.Int("workerID", workerID),
+		zap.Int("flushed", flushed),
+		zap.Int("closed", closed))
 }
 
 func (l *engineLogger) UDPStreamNew(workerID int, info ruleset.StreamInfo) {
@@ -320,20 +413,19 @@ func (l *engineLogger) UDPStreamPropUpdate(info ruleset.StreamInfo, close bool) 
 }
 
 func (l *engineLogger) UDPStreamAction(info ruleset.StreamInfo, action ruleset.Action, noMatch bool) {
-	logger.Info("UDP stream action",
-		zap.Int64("id", info.ID),
-		zap.String("src", info.SrcString()),
-		zap.String("dst", info.DstString()),
-		zap.String("action", action.String()),
-		zap.Bool("noMatch", noMatch))
-}
-
-func (l *engineLogger) MatchError(info ruleset.StreamInfo, err error) {
-	logger.Error("match error",
-		zap.Int64("id", info.ID),
-		zap.String("src", info.SrcString()),
-		zap.String("dst", info.DstString()),
-		zap.Error(err))
+	if noMatch {
+		logger.Debug("UDP stream no match",
+			zap.Int64("id", info.ID),
+			zap.String("src", info.SrcString()),
+			zap.String("dst", info.DstString()),
+			zap.String("action", action.String()))
+	} else {
+		logger.Info("UDP stream action",
+			zap.Int64("id", info.ID),
+			zap.String("src", info.SrcString()),
+			zap.String("dst", info.DstString()),
+			zap.String("action", action.String()))
+	}
 }
 
 func (l *engineLogger) ModifyError(info ruleset.StreamInfo, err error) {
@@ -365,17 +457,29 @@ func (l *engineLogger) AnalyzerErrorf(streamID int64, name string, format string
 		zap.String("msg", fmt.Sprintf(format, args...)))
 }
 
+type rulesetLogger struct{}
+
+func (l *rulesetLogger) Log(info ruleset.StreamInfo, name string) {
+	logger.Info("ruleset log",
+		zap.String("name", name),
+		zap.Int64("id", info.ID),
+		zap.String("src", info.SrcString()),
+		zap.String("dst", info.DstString()),
+		zap.Any("props", info.Props))
+}
+
+func (l *rulesetLogger) MatchError(info ruleset.StreamInfo, name string, err error) {
+	logger.Error("ruleset match error",
+		zap.String("name", name),
+		zap.Int64("id", info.ID),
+		zap.String("src", info.SrcString()),
+		zap.String("dst", info.DstString()),
+		zap.Error(err))
+}
+
 func envOrDefaultString(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
-	}
-	return def
-}
-
-func envOrDefaultBool(key string, def bool) bool {
-	if v := os.Getenv(key); v != "" {
-		b, _ := strconv.ParseBool(v)
-		return b
 	}
 	return def
 }

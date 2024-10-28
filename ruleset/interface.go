@@ -1,11 +1,13 @@
 package ruleset
 
 import (
+	"context"
 	"net"
 	"strconv"
 
 	"github.com/apernet/OpenGFW/analyzer"
 	"github.com/apernet/OpenGFW/modifier"
+	"github.com/apernet/OpenGFW/ruleset/builtins/geo"
 )
 
 type Action int
@@ -90,5 +92,17 @@ type Ruleset interface {
 	Analyzers(StreamInfo) []analyzer.Analyzer
 	// Match matches a stream against the ruleset and returns the result.
 	// It must be safe for concurrent use by multiple workers.
-	Match(StreamInfo) (MatchResult, error)
+	Match(StreamInfo) MatchResult
+}
+
+// Logger is the logging interface for the ruleset.
+type Logger interface {
+	Log(info StreamInfo, name string)
+	MatchError(info StreamInfo, name string, err error)
+}
+
+type BuiltinConfig struct {
+	Logger               Logger
+	GeoMatcher           *geo.GeoMatcher
+	ProtectedDialContext func(ctx context.Context, network, address string) (net.Conn, error)
 }
